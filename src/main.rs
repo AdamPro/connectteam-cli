@@ -43,6 +43,18 @@ struct TimesheetParams {
     _spirit: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PunchclockDataParams {
+    #[serde(rename = "objectId")]
+    object_id: u64,
+
+    #[serde(rename = "defaultTimezone")]
+    default_timezone: String,
+
+    #[serde(rename = "_spirit")]
+    _spirit: String,
+}
+
 pub trait AsVec {
     type Item;
     fn as_vec(&self) -> &Vec<Self::Item>;
@@ -96,19 +108,40 @@ fn get_object_id_from_api(session_info: &SessionInfo) -> Result<u64, Box<dyn Err
     return Ok(object_ids[0].as_fixed_point_u64(0).unwrap());
 }
 
-fn send_request(session_info: &SessionInfo) -> Result<String, Box<dyn Error>> {
+fn send_request_get_timesheet(session_info: &SessionInfo) -> Result<String, Box<dyn Error>> {
     let client = reqwest::blocking::Client::new();
 
     let request_payload = TimesheetParams {
         start_date: "2023-02-01".to_string(),
-        end_date: "2023-02-13".to_string(),
+        end_date: "2023-02-28".to_string(),
         object_id: get_object_id_from_api(&session_info)?,
         default_timezone: "Europe/Warsaw".to_string(),
-        _spirit: "8ed13f59-dee1-4046-b91e-d5ede0d42859".to_string(),
+        _spirit: session_info.spirit.clone(),
     };
 
     let resp_raw = client
         .post("https://app.connecteam.com/api/UserDashboard/PunchClock/Timesheet/")
+        .header(
+            "cookie",
+            f!("session={session_info.session}; _spirit={session_info.spirit}; "),
+        )
+        .body(json!(request_payload).to_string())
+        .send();
+
+    return Ok(resp_raw?.text()?);
+}
+
+fn send_request_get_punchclock_data(session_info: &SessionInfo) -> Result<String, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::new();
+
+    let request_payload = PunchclockDataParams {
+        object_id: get_object_id_from_api(&session_info)?,
+        default_timezone: "Europe/Warsaw".to_string(),
+        _spirit: session_info.spirit.clone(),
+    };
+
+    let resp_raw = client
+        .post("https://app.connecteam.com/api/UserDashboard/PunchClock/Data/")
         .header(
             "cookie",
             f!("session={session_info.session}; _spirit={session_info.spirit}; "),
@@ -135,11 +168,23 @@ fn parse_timesheet(resp: String) -> Result<Vec<TimesheetEntry>, Box<dyn Error>> 
                     .unwrap();
                 return Utc.timestamp_opt(seconds_since_epoch, 0).unwrap();
             };
+            
+            let mut desc = "".to_string();
+            let free_text = shift["shiftAttachments"].as_vec()[0]["freeText"].to_string();
+            let notes = shift["employeeNotes"].to_string();
+
+            if !(free_text == "" || free_text == "null") && notes != "" {
+                desc = f!("{free_text} / {notes}");
+            } else if !(free_text == "" || free_text == "null") {
+                desc = free_text;
+            } else if notes != "" {
+                desc = notes;
+            }
 
             TimesheetEntry {
                 start: parse_timestamp(&shift["punchIn"]),
                 end: parse_timestamp(&shift["punchOut"]),
-                desc: shift["employeeNotes"].to_string(),
+                desc: desc,
                 project: shift["punchTag"]["name"].to_string(),
                 subproject: shift["punchTag"]["subItems"][0]["name"].to_string(),
             }
@@ -149,10 +194,47 @@ fn parse_timesheet(resp: String) -> Result<Vec<TimesheetEntry>, Box<dyn Error>> 
     return Ok(timesheet_entries);
 }
 
+fn parse_punchclock(resp: String) -> Result<(), Box<dyn Error>> {
+    let parsed = json::parse(&resp)?;
+
+    let shift_attachment = &parsed["data"]["punchClockSettings"]["shiftAttachments"]
+        .as_vec()
+        .iter()
+        .map(|x| {
+            (
+                x["id"].to_string(),
+                x["name"].to_string(),
+                x["type"].to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    println!("{:?}", shift_attachment);
+
+    let available_tags = &parsed["data"]["availableTags"]
+        .as_vec()
+        .iter()
+        .flat_map(|x| {
+            let sub_items = 
+            x["subItems"]
+                .as_vec();
+            if sub_items.is_empty() {
+                return vec![(x["name"].to_string(), "".to_string())];
+            }
+            else {
+                return sub_items.iter().map(|y| (x["name"].to_string(), y["name"].to_string())).collect();
+            }
+        })
+        .collect::<Vec<_>>();
+
+    println!("{:?}", available_tags);
+
+    return Ok(());
+}
+
 fn load_session_info_or_ask_user() -> Result<SessionInfo, Box<dyn Error>> {
     let mut session_info_file = home::home_dir().unwrap();
     session_info_file.push(".config/connectteam.json");
-    println!("{:?}", session_info_file);
 
     if session_info_file.exists() {
         let info_json = std::fs::read_to_string(session_info_file)?;
@@ -239,11 +321,18 @@ fn draw_timesheet(entries: &mut Vec<TimesheetEntry>) {
     println!("{}", table.render());
 }
 
+
 fn main() -> Result<(), Box<dyn Error>> {
     let session_info = load_session_info_or_ask_user()?;
 
-    let resp = send_request(&session_info)?;
+    let resp = send_request_get_timesheet(&session_info)?;
     let mut entries = parse_timesheet(resp)?;
+
+    let punchlock_data_resp = send_request_get_punchclock_data(&session_info)?;
+    parse_punchclock(punchlock_data_resp)?;
+    // println!("{:?}", punchlock_data_resp);
+
+    // println!("{:?}", json::parse(&punchlock_data_resp)?);
 
     draw_timesheet(&mut entries);
     Ok(())
